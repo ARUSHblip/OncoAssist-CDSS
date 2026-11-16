@@ -29,7 +29,7 @@ except Exception:
     st.error("⚠️ Model file 'tumor_model.h5' nahi mili!")
     model_ready = False
 
-# 1. Scanner Gatekeeper: Out-of-Distribution (OOD) Rejection Filter
+# 1. Out-of-Distribution (OOD) Scanner Gatekeeper
 def is_valid_brain_mri(img_np):
     if len(img_np.shape) == 3:
         r, g, b = img_np[:,:,0], img_np[:,:,1], img_np[:,:,2]
@@ -47,20 +47,20 @@ def is_valid_brain_mri(img_np):
     if np.mean(top_corners) > 85:
         return False, "Invalid background luminosity. MRI scanners require a dark field background."
 
-    _, thresh = cv2.threshold(gray, 18, 255, cv2.THRESH_BINARY)
+    _, thresh = cv2.threshold(gray, 25, 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours or cv2.contourArea(max(contours, key=cv2.contourArea)) < (h * w * 0.10):
         return False, "Insufficient cranial tissue density identified in the imaging field."
 
     return True, "Valid MRI"
 
-# 2. Strict Skull-Stripped Intracranial Lesion Isolator
+# 2. Precision Lesion Isolator with Shape & Skull Exclusion
 def isolate_hyperintense_tumor(img_np):
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY) if len(img_np.shape) == 3 else img_np
     h, w = gray.shape
 
-    # Brain parenchyma segmentation
-    _, brain_thresh = cv2.threshold(gray, 35, 255, cv2.THRESH_BINARY)
+    # Deep cranial vault segmentation
+    _, brain_thresh = cv2.threshold(gray, 30, 255, cv2.THRESH_BINARY)
     b_contours, _ = cv2.findContours(brain_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not b_contours:
         return None, (0, 0, 0, 0), "None", "Non-Eloquent"
@@ -69,8 +69,8 @@ def isolate_hyperintense_tumor(img_np):
     brain_mask = np.zeros((h, w), dtype=np.uint8)
     cv2.drawContours(brain_mask, [largest_c], -1, 255, -1)
 
-    # Inward morphological erosion to completely shave off the skull bone ring
-    erode_size = max(5, int(min(h, w) * 0.07))
+    # Inward shaving to completely destroy the skull bone rim
+    erode_size = max(9, int(min(h, w) * 0.09))
     erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_size, erode_size))
     brain_mask = cv2.erode(brain_mask, erode_k, iterations=1)
 
@@ -80,22 +80,31 @@ def isolate_hyperintense_tumor(img_np):
     if len(valid_pixels) == 0:
         return None, (0, 0, 0, 0), "None", "Non-Eloquent"
 
-    # Hyperintense contrast lesion detection inside brain tissue
-    p_thresh = np.percentile(valid_pixels, 94.5)
+    # Focus strictly on hyperintense solid contrast-enhancing core
+    p_thresh = np.percentile(valid_pixels, 96.0)
     _, binary = cv2.threshold(parenchyma, int(p_thresh), 255, cv2.THRESH_BINARY)
 
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k, iterations=2)
 
     contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    # Must be within lesion dimensions (not full brain, not single-pixel noise)
-    valid = [c for c in contours if (cv2.contourArea(c) > 100) and (cv2.contourArea(c) < (h * w * 0.22))]
+    # Tumor geometry checks: reject long curved arcs (bone remnants)
+    valid_tumors = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if 100 < area < (h * w * 0.20):
+            peri = cv2.arcLength(c, True)
+            if peri > 0:
+                circularity = 4 * np.pi * (area / (peri * peri))
+                # Circularity > 0.15 rejects skinny boundary ribbons/skull lines
+                if circularity > 0.15:
+                    valid_tumors.append(c)
 
-    if not valid:
-        return None, (0, 0, 0, 0), "Diffuse / Inconclusive", "Non-Eloquent"
+    if not valid_tumors:
+        return None, (0, 0, 0, 0), "Inconclusive", "Non-Eloquent"
 
-    best_contour = max(valid, key=cv2.contourArea)
+    best_contour = max(valid_tumors, key=cv2.contourArea)
     x, y, tw, th = cv2.boundingRect(best_contour)
 
     t_center_x = x + tw // 2
@@ -167,7 +176,7 @@ def build_stereotactic_3d(img_np, bbox, eloquence_str):
     tv = np.linspace(0, np.pi, 24)
     TU, TV = np.meshgrid(tu, tv)
     lobulation = 1.0 + 0.12 * np.sin(3 * TU) * np.sin(2 * TV)
-    tx = target_x + rad_x * np.cos(TU) * np.sin(TU) * lobulation
+    tx = target_x + rad_x * np.cos(TU) * np.sin(TV) * lobulation
     ty = target_y + rad_y * np.sin(TU) * np.sin(TV) * lobulation
     tz = rad_z * np.cos(TV) * lobulation
 
@@ -233,39 +242,42 @@ if uploaded_file is not None and model_ready:
             st.error(f"🚫 **INPUT REJECTED BY MEDICAL GATEKEEPER:**\n\n{validation_msg}")
             st.warning("⚠️ **Clinical Safety Protocol:** The CDSS rejects non-MRI / Out-of-Distribution (OOD) modalities to prevent severe diagnostic hallucinations.")
     else:
+        # Preprocessing & MobileNetV2 Inference
         img_resized = cv2.resize(img_np, (224, 224)) / 255.0
         img_batch = np.expand_dims(img_resized, axis=0)
 
         raw_pred = float(model.predict(img_batch)[0][0])
         
-        tumor_contour, bbox, location_str, eloquence_str = isolate_hyperintense_tumor(img_np)
-        has_lesion_feature = (tumor_contour is not None and bbox[2] > 0 and bbox[3] > 0)
+        # Primary decision: MobileNetV2 confidence threshold
+        has_tumor = (raw_pred > 0.5)
+        confidence = raw_pred if has_tumor else (1.0 - raw_pred)
 
-        if has_lesion_feature:
-            has_tumor = True
-            confidence = raw_pred if raw_pred > 0.5 else (1.0 - raw_pred)
-        else:
-            has_tumor = (raw_pred > 0.5)
-            confidence = raw_pred if has_tumor else (1.0 - raw_pred)
+        tumor_contour = None
+        bbox = (0, 0, 0, 0)
+        location_str = "N/A"
+        eloquence_str = "N/A"
+        major_axis_mm = 0.0
 
         with col2:
             st.subheader("2. AI Precision Lesion Segmentation")
             annotated = img_np.copy()
-            major_axis_mm = 0.0
 
-            if has_tumor and has_lesion_feature:
+            if has_tumor:
+                tumor_contour, bbox, location_str, eloquence_str = isolate_hyperintense_tumor(img_np)
                 x, y, w, h = bbox
-                cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                cv2.drawContours(annotated, [tumor_contour], -1, (255, 0, 0), 2)
-                major_axis_mm = max(w, h) * 0.42
-                st.image(annotated, caption="Segmented Focal Lesion (Green: ROI, Blue: Neoplasm Boundary)", use_container_width=True)
-            elif has_tumor and not has_lesion_feature:
-                major_axis_mm = 22.0
-                st.image(img_np, caption="Diffuse Infiltrative Hyperintensity Identified", use_container_width=True)
+                if tumor_contour is not None and w > 0:
+                    cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    cv2.drawContours(annotated, [tumor_contour], -1, (255, 0, 0), 2)
+                    major_axis_mm = max(w, h) * 0.42
+                    st.image(annotated, caption="Segmented Focal Lesion (Green: ROI, Blue: Neoplasm Boundary)", use_container_width=True)
+                else:
+                    major_axis_mm = 22.0
+                    st.image(annotated, caption="Diffuse Infiltrative Hyperintensity (Non-circumscribed)", use_container_width=True)
             else:
+                # Strictly clean normal display for healthy brains
                 st.image(img_np, caption="Normal Brain Parenchyma (No Focal Enhancing Mass)", use_container_width=True)
 
-        if has_tumor and has_lesion_feature:
+        if has_tumor and tumor_contour is not None and bbox[2] > 0:
             st.write("---")
             st.subheader("3. 3D Stereotactic Localization & DTI Tractography Simulation")
             fig_3d = build_stereotactic_3d(img_np, bbox, eloquence_str)
@@ -283,39 +295,39 @@ if uploaded_file is not None and model_ready:
         st.write("---")
         st.subheader("5. Clinical Decision Support System (CDSS) & Patient Triage")
 
-        st.write("⚡ **Demonstration Scenarios (1-Click Triage Presets):**")
-        pcol1, pcol2, pcol3 = st.columns([1.5, 1.5, 3])
-        if pcol1.button("🟢 Preset A: Favorable Candidate (RPA III / Awake GTR)"):
-            st.session_state["p_age"] = 38
-            st.session_state["p_kps"] = 90
-            st.session_state["p_sym"] = "Focal / Generalized Epileptic Seizures"
-        if pcol2.button("🔴 Preset B: Fragile Baseline (RPA VI / Biopsy Only)"):
-            st.session_state["p_age"] = 72
-            st.session_state["p_kps"] = 50
-            st.session_state["p_sym"] = "Progressive Hemiparesis / Dysphasia (Motor Deficit)"
-
-        if "p_age" not in st.session_state:
-            st.session_state["p_age"] = 54
-            st.session_state["p_kps"] = 70
-            st.session_state["p_sym"] = "Intractable Morning Cephalea + Papilledema (High ICP)"
-
-        with st.expander("🩺 Patient Clinical Presentation & Functional Baseline", expanded=True):
-            sc1, sc2, sc3, sc4 = st.columns(4)
-            patient_age = sc1.number_input("Patient Age (Years)", min_value=1, max_value=100, value=st.session_state["p_age"])
-            kps_score = sc2.selectbox("Karnofsky Performance Scale (KPS)", [100, 90, 80, 70, 60, 50, 40], 
-                                      index=[100, 90, 80, 70, 60, 50, 40].index(st.session_state["p_kps"]))
-            ecog_score = 0 if kps_score >= 90 else (1 if kps_score >= 70 else (2 if kps_score >= 50 else 3))
-            
-            sym_list = [
-                "Focal / Generalized Epileptic Seizures",
-                "Progressive Hemiparesis / Dysphasia (Motor Deficit)",
-                "Intractable Morning Cephalea + Papilledema (High ICP)",
-                "Incidental / Asymptomatic Presentation"
-            ]
-            presentation = sc3.selectbox("Primary Clinical Deficit", sym_list, index=sym_list.index(st.session_state["p_sym"]))
-            contrast_avid = sc4.selectbox("T1-CE Enhancement Margin", ["Thick Irregular Rim (Necrotic Core)", "Homogeneous Solid", "Non-Enhancing / Infiltrative"])
-
         if has_tumor:
+            st.write("⚡ **Demonstration Scenarios (1-Click Triage Presets):**")
+            pcol1, pcol2, pcol3 = st.columns([1.5, 1.5, 3])
+            if pcol1.button("🟢 Preset A: Favorable Candidate (RPA III / Awake GTR)"):
+                st.session_state["p_age"] = 38
+                st.session_state["p_kps"] = 90
+                st.session_state["p_sym"] = "Focal / Generalized Epileptic Seizures"
+            if pcol2.button("🔴 Preset B: Fragile Baseline (RPA VI / Biopsy Only)"):
+                st.session_state["p_age"] = 72
+                st.session_state["p_kps"] = 50
+                st.session_state["p_sym"] = "Progressive Hemiparesis / Dysphasia (Motor Deficit)"
+
+            if "p_age" not in st.session_state:
+                st.session_state["p_age"] = 54
+                st.session_state["p_kps"] = 70
+                st.session_state["p_sym"] = "Intractable Morning Cephalea + Papilledema (High ICP)"
+
+            with st.expander("🩺 Patient Clinical Presentation & Functional Baseline", expanded=True):
+                sc1, sc2, sc3, sc4 = st.columns(4)
+                patient_age = sc1.number_input("Patient Age (Years)", min_value=1, max_value=100, value=st.session_state["p_age"])
+                kps_score = sc2.selectbox("Karnofsky Performance Scale (KPS)", [100, 90, 80, 70, 60, 50, 40], 
+                                          index=[100, 90, 80, 70, 60, 50, 40].index(st.session_state["p_kps"]))
+                ecog_score = 0 if kps_score >= 90 else (1 if kps_score >= 70 else (2 if kps_score >= 50 else 3))
+                
+                sym_list = [
+                    "Focal / Generalized Epileptic Seizures",
+                    "Progressive Hemiparesis / Dysphasia (Motor Deficit)",
+                    "Intractable Morning Cephalea + Papilledema (High ICP)",
+                    "Incidental / Asymptomatic Presentation"
+                ]
+                presentation = sc3.selectbox("Primary Clinical Deficit", sym_list, index=sym_list.index(st.session_state["p_sym"]))
+                contrast_avid = sc4.selectbox("T1-CE Enhancement Margin", ["Thick Irregular Rim (Necrotic Core)", "Homogeneous Solid", "Non-Enhancing / Infiltrative"])
+
             if patient_age < 50 and kps_score >= 70:
                 rpa_class = "RTOG RPA Class III (Favorable / Aggressive Resection Candidate)"
                 rpa_badge_bg = "#059669"
