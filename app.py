@@ -54,13 +54,14 @@ def is_valid_brain_mri(img_np):
 
     return True, "Valid MRI"
 
-# 2. Precision Lesion Isolator with Shape & Skull Exclusion
+# 2. Precision Lesion Isolator with Multi-Layer Skull Stripping & Bone Rejection
 def isolate_hyperintense_tumor(img_np):
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY) if len(img_np.shape) == 3 else img_np
     h, w = gray.shape
 
-    # Deep cranial vault segmentation
-    _, brain_thresh = cv2.threshold(gray, 30, 255, cv2.THRESH_BINARY)
+    # Cranial mask creation
+    blur = cv2.GaussianBlur(gray, (7, 7), 0)
+    _, brain_thresh = cv2.threshold(blur, 30, 255, cv2.THRESH_BINARY)
     b_contours, _ = cv2.findContours(brain_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not b_contours:
         return None, (0, 0, 0, 0), "None", "Non-Eloquent"
@@ -69,9 +70,10 @@ def isolate_hyperintense_tumor(img_np):
     brain_mask = np.zeros((h, w), dtype=np.uint8)
     cv2.drawContours(brain_mask, [largest_c], -1, 255, -1)
 
-    # Inward shaving to completely destroy the skull bone rim
-    erode_size = max(9, int(min(h, w) * 0.09))
-    erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_size, erode_size))
+    # Deep morphological erosion (14% inward boundary) to eliminate sinus and calvarial bone
+    erode_w = max(11, int(w * 0.14))
+    erode_h = max(11, int(h * 0.14))
+    erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_w, erode_h))
     brain_mask = cv2.erode(brain_mask, erode_k, iterations=1)
 
     parenchyma = cv2.bitwise_and(gray, gray, mask=brain_mask)
@@ -80,31 +82,32 @@ def isolate_hyperintense_tumor(img_np):
     if len(valid_pixels) == 0:
         return None, (0, 0, 0, 0), "None", "Non-Eloquent"
 
-    # Focus strictly on hyperintense solid contrast-enhancing core
-    p_thresh = np.percentile(valid_pixels, 96.0)
-    _, binary = cv2.threshold(parenchyma, int(p_thresh), 255, cv2.THRESH_BINARY)
+    # Statistical adaptive thresholding
+    p_mean = np.mean(valid_pixels)
+    p_std = np.std(valid_pixels)
+    adaptive_cutoff = int(min(240, p_mean + 1.25 * p_std))
 
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    _, binary = cv2.threshold(parenchyma, adaptive_cutoff, 255, cv2.THRESH_BINARY)
+
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
     closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k, iterations=2)
 
     contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    # Tumor geometry checks: reject long curved arcs (bone remnants)
-    valid_tumors = []
+    # Filter candidates by area and aspect ratio to reject skinny bone remnants
+    candidates = []
     for c in contours:
         area = cv2.contourArea(c)
-        if 100 < area < (h * w * 0.20):
-            peri = cv2.arcLength(c, True)
-            if peri > 0:
-                circularity = 4 * np.pi * (area / (peri * peri))
-                # Circularity > 0.15 rejects skinny boundary ribbons/skull lines
-                if circularity > 0.15:
-                    valid_tumors.append(c)
+        if area > 180 and area < (h * w * 0.35):
+            bx, by, bw, bh = cv2.boundingRect(c)
+            aspect_ratio = max(bw, bh) / max(1, min(bw, bh))
+            if aspect_ratio < 3.2:
+                candidates.append(c)
 
-    if not valid_tumors:
-        return None, (0, 0, 0, 0), "Inconclusive", "Non-Eloquent"
+    if not candidates:
+        return None, (0, 0, 0, 0), "Diffuse / Non-circumscribed", "Non-Eloquent"
 
-    best_contour = max(valid_tumors, key=cv2.contourArea)
+    best_contour = max(candidates, key=cv2.contourArea)
     x, y, tw, th = cv2.boundingRect(best_contour)
 
     t_center_x = x + tw // 2
@@ -242,13 +245,11 @@ if uploaded_file is not None and model_ready:
             st.error(f"🚫 **INPUT REJECTED BY MEDICAL GATEKEEPER:**\n\n{validation_msg}")
             st.warning("⚠️ **Clinical Safety Protocol:** The CDSS rejects non-MRI / Out-of-Distribution (OOD) modalities to prevent severe diagnostic hallucinations.")
     else:
-        # Preprocessing & MobileNetV2 Inference
         img_resized = cv2.resize(img_np, (224, 224)) / 255.0
         img_batch = np.expand_dims(img_resized, axis=0)
 
         raw_pred = float(model.predict(img_batch)[0][0])
         
-        # Primary decision: MobileNetV2 confidence threshold
         has_tumor = (raw_pred > 0.5)
         confidence = raw_pred if has_tumor else (1.0 - raw_pred)
 
@@ -274,7 +275,6 @@ if uploaded_file is not None and model_ready:
                     major_axis_mm = 22.0
                     st.image(annotated, caption="Diffuse Infiltrative Hyperintensity (Non-circumscribed)", use_container_width=True)
             else:
-                # Strictly clean normal display for healthy brains
                 st.image(img_np, caption="Normal Brain Parenchyma (No Focal Enhancing Mass)", use_container_width=True)
 
         if has_tumor and tumor_contour is not None and bbox[2] > 0:
