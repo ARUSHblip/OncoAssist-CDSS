@@ -54,39 +54,46 @@ def is_valid_brain_mri(img_np):
 
     return True, "Valid MRI"
 
-# 2. Hard-Shielded Intracranial Lesion Isolator
+# 2. Strict Skull-Stripped Intracranial Lesion Isolator
 def isolate_hyperintense_tumor(img_np):
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY) if len(img_np.shape) == 3 else img_np
     h, w = gray.shape
 
-    mask = np.zeros((h, w), dtype=np.uint8)
-    cx, cy = w // 2, h // 2
-    rx, ry = int(w * 0.38), int(h * 0.42)
-    cv2.ellipse(mask, (cx, cy), (rx, ry), 0, 0, 360, 255, -1)
+    # Brain parenchyma segmentation
+    _, brain_thresh = cv2.threshold(gray, 35, 255, cv2.THRESH_BINARY)
+    b_contours, _ = cv2.findContours(brain_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not b_contours:
+        return None, (0, 0, 0, 0), "None", "Non-Eloquent"
 
-    parenchyma = cv2.bitwise_and(gray, gray, mask=mask)
-    valid_pixels = parenchyma[mask > 0]
+    largest_c = max(b_contours, key=cv2.contourArea)
+    brain_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(brain_mask, [largest_c], -1, 255, -1)
+
+    # Inward morphological erosion to completely shave off the skull bone ring
+    erode_size = max(5, int(min(h, w) * 0.07))
+    erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_size, erode_size))
+    brain_mask = cv2.erode(brain_mask, erode_k, iterations=1)
+
+    parenchyma = cv2.bitwise_and(gray, gray, mask=brain_mask)
+    valid_pixels = parenchyma[brain_mask > 0]
 
     if len(valid_pixels) == 0:
         return None, (0, 0, 0, 0), "None", "Non-Eloquent"
 
-    p_thresh = np.percentile(valid_pixels, 96.0)
+    # Hyperintense contrast lesion detection inside brain tissue
+    p_thresh = np.percentile(valid_pixels, 94.5)
     _, binary = cv2.threshold(parenchyma, int(p_thresh), 255, cv2.THRESH_BINARY)
 
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k, iterations=3)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k, iterations=2)
 
     contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    valid = [c for c in contours if 70 < cv2.contourArea(c) < (h * w * 0.25)]
+    
+    # Must be within lesion dimensions (not full brain, not single-pixel noise)
+    valid = [c for c in contours if (cv2.contourArea(c) > 100) and (cv2.contourArea(c) < (h * w * 0.22))]
 
     if not valid:
-        p_thresh2 = np.percentile(valid_pixels, 92.0)
-        _, binary2 = cv2.threshold(parenchyma, int(p_thresh2), 255, cv2.THRESH_BINARY)
-        closed2 = cv2.morphologyEx(binary2, cv2.MORPH_CLOSE, k, iterations=3)
-        contours2, _ = cv2.findContours(closed2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        valid = [c for c in contours2 if 70 < cv2.contourArea(c) < (h * w * 0.25)]
-        if not valid:
-            return None, (0, 0, 0, 0), "Inconclusive", "Non-Eloquent"
+        return None, (0, 0, 0, 0), "Diffuse / Inconclusive", "Non-Eloquent"
 
     best_contour = max(valid, key=cv2.contourArea)
     x, y, tw, th = cv2.boundingRect(best_contour)
@@ -160,7 +167,7 @@ def build_stereotactic_3d(img_np, bbox, eloquence_str):
     tv = np.linspace(0, np.pi, 24)
     TU, TV = np.meshgrid(tu, tv)
     lobulation = 1.0 + 0.12 * np.sin(3 * TU) * np.sin(2 * TV)
-    tx = target_x + rad_x * np.cos(TU) * np.sin(TV) * lobulation
+    tx = target_x + rad_x * np.cos(TU) * np.sin(TU) * lobulation
     ty = target_y + rad_y * np.sin(TU) * np.sin(TV) * lobulation
     tz = rad_z * np.cos(TV) * lobulation
 
@@ -226,17 +233,14 @@ if uploaded_file is not None and model_ready:
             st.error(f"🚫 **INPUT REJECTED BY MEDICAL GATEKEEPER:**\n\n{validation_msg}")
             st.warning("⚠️ **Clinical Safety Protocol:** The CDSS rejects non-MRI / Out-of-Distribution (OOD) modalities to prevent severe diagnostic hallucinations.")
     else:
-        # Preprocessing & Dual Forward Pass
         img_resized = cv2.resize(img_np, (224, 224)) / 255.0
         img_batch = np.expand_dims(img_resized, axis=0)
 
         raw_pred = float(model.predict(img_batch)[0][0])
         
-        # Lesion isolator run pehle execute karo taaki consensus decide ho sake
         tumor_contour, bbox, location_str, eloquence_str = isolate_hyperintense_tumor(img_np)
         has_lesion_feature = (tumor_contour is not None and bbox[2] > 0 and bbox[3] > 0)
 
-        # Smart Consensus Logic (Handles label inversion automatically)
         if has_lesion_feature:
             has_tumor = True
             confidence = raw_pred if raw_pred > 0.5 else (1.0 - raw_pred)
