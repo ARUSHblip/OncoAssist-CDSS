@@ -29,7 +29,7 @@ except Exception:
     st.error("⚠️ Model file 'tumor_model.h5' nahi mili!")
     model_ready = False
 
-# 1. Out-of-Distribution (OOD) Scanner Gatekeeper
+# 1. Scanner Gatekeeper: Out-of-Distribution (OOD) Rejection Filter
 def is_valid_brain_mri(img_np):
     if len(img_np.shape) == 3:
         r, g, b = img_np[:,:,0], img_np[:,:,1], img_np[:,:,2]
@@ -54,87 +54,80 @@ def is_valid_brain_mri(img_np):
 
     return True, "Valid MRI"
 
-# 2. Precision Lesion Isolator with Multi-Layer Skull Stripping & Bone Rejection
-def isolate_hyperintense_tumor(img_np):
+# 2. Multi-Focal Lesion Segmentor with Strict Skull Isolation
+def isolate_all_tumors(img_np):
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY) if len(img_np.shape) == 3 else img_np
     h, w = gray.shape
 
-    # Cranial mask creation
     blur = cv2.GaussianBlur(gray, (7, 7), 0)
-    _, brain_thresh = cv2.threshold(blur, 30, 255, cv2.THRESH_BINARY)
+    _, brain_thresh = cv2.threshold(blur, 35, 255, cv2.THRESH_BINARY)
     b_contours, _ = cv2.findContours(brain_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not b_contours:
-        return None, (0, 0, 0, 0), "None", "Non-Eloquent"
+        return []
 
     largest_c = max(b_contours, key=cv2.contourArea)
     brain_mask = np.zeros((h, w), dtype=np.uint8)
     cv2.drawContours(brain_mask, [largest_c], -1, 255, -1)
 
-    # Deep morphological erosion (14% inward boundary) to eliminate sinus and calvarial bone
-    erode_w = max(11, int(w * 0.14))
-    erode_h = max(11, int(h * 0.14))
-    erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_w, erode_h))
+    # Inset erosion (12%) to remove outer calvarial bone & sinus boundary
+    erode_size = max(11, int(min(h, w) * 0.12))
+    erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_size, erode_size))
     brain_mask = cv2.erode(brain_mask, erode_k, iterations=1)
 
     parenchyma = cv2.bitwise_and(gray, gray, mask=brain_mask)
     valid_pixels = parenchyma[brain_mask > 0]
 
     if len(valid_pixels) == 0:
-        return None, (0, 0, 0, 0), "None", "Non-Eloquent"
+        return []
 
-    # Statistical adaptive thresholding
     p_mean = np.mean(valid_pixels)
     p_std = np.std(valid_pixels)
-    adaptive_cutoff = int(min(240, p_mean + 1.25 * p_std))
+    cutoff = int(min(245, p_mean + 1.35 * p_std))
 
-    _, binary = cv2.threshold(parenchyma, adaptive_cutoff, 255, cv2.THRESH_BINARY)
-
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    _, binary = cv2.threshold(parenchyma, cutoff, 255, cv2.THRESH_BINARY)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k, iterations=2)
 
     contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    # Filter candidates by area and aspect ratio to reject skinny bone remnants
-    candidates = []
+    detected_lesions = []
     for c in contours:
         area = cv2.contourArea(c)
-        if area > 180 and area < (h * w * 0.35):
+        if 80 < area < (h * w * 0.30):
             bx, by, bw, bh = cv2.boundingRect(c)
             aspect_ratio = max(bw, bh) / max(1, min(bw, bh))
-            if aspect_ratio < 3.2:
-                candidates.append(c)
+            if aspect_ratio < 2.8:  # Rejects thin bone slices/arcs
+                cx, cy = bx + bw // 2, by + bh // 2
+                is_left = cx >= (w // 2)
+                is_frontal = cy < (h // 2)
+                hemi = "Left Hemisphere" if is_left else "Right Hemisphere"
+                lobe = "Frontal/Parietal" if is_frontal else "Temporal/Occipital"
+                loc = f"{hemi} ({lobe})"
 
-    if not candidates:
-        return None, (0, 0, 0, 0), "Diffuse / Non-circumscribed", "Non-Eloquent"
+                if not is_left and is_frontal:
+                    eloquence = "INTERMEDIATE (Right Frontal Cortex / Pre-Motor Area)"
+                elif is_left and is_frontal:
+                    eloquence = "HIGH ELOQUENCE (Broca's Language / Left Motor Strip)"
+                elif is_left and not is_frontal:
+                    eloquence = "HIGH ELOQUENCE (Wernicke's Sensory Language / Arcuate Fasciculus)"
+                else:
+                    eloquence = "NON-ELOQUENT / PERIPHERAL CORTEX"
 
-    best_contour = max(candidates, key=cv2.contourArea)
-    x, y, tw, th = cv2.boundingRect(best_contour)
+                detected_lesions.append({
+                    "contour": c,
+                    "bbox": (bx, by, bw, bh),
+                    "location": loc,
+                    "eloquence": eloquence,
+                    "area_px": area,
+                    "diameter_mm": round(max(bw, bh) * 0.42, 1)
+                })
 
-    t_center_x = x + tw // 2
-    t_center_y = y + th // 2
-    is_left = t_center_x >= (w // 2)
-    hemi = "Left Hemisphere" if is_left else "Right Hemisphere"
-    is_frontal = t_center_y < (h // 2)
-    lobe = "Frontal/Parietal" if is_frontal else "Temporal/Occipital"
-    location_str = f"{hemi} ({lobe})"
+    detected_lesions.sort(key=lambda x: x["area_px"], reverse=True)
+    return detected_lesions
 
-    if not is_left and is_frontal:
-        eloquence = "INTERMEDIATE (Right Frontal Cortex / Pre-Motor Area)"
-    elif is_left and is_frontal:
-        eloquence = "HIGH ELOQUENCE (Broca's Language / Left Motor Strip)"
-    elif is_left and not is_frontal:
-        eloquence = "HIGH ELOQUENCE (Wernicke's Sensory Language / Arcuate Fasciculus)"
-    else:
-        eloquence = "NON-ELOQUENT / PERIPHERAL CORTEX"
-
-    return best_contour, (x, y, tw, th), location_str, eloquence
-
-# 3. 3D Stereotactic Viewer
-def build_stereotactic_3d(img_np, bbox, eloquence_str):
+# 3. 3D Stereotactic Viewer (Multi-Mass Enabled)
+def build_stereotactic_3d(img_np, lesions, primary_eloquence):
     h, w = img_np.shape[:2]
-    x, y, bw, bh = bbox
-    cx, cy = x + bw // 2, y + bh // 2
-
     world_w, world_h = 120.0, 150.0
     traces = []
 
@@ -150,12 +143,13 @@ def build_stereotactic_3d(img_np, bbox, eloquence_str):
         x=PX, y=PY, z=PZ,
         surfacecolor=slice_flipped,
         colorscale='Gray',
-        opacity=0.70,
+        opacity=0.65,
         showscale=False,
         name='Patient Scan Plane',
         hoverinfo='skip'
     ))
 
+    # Cranial Vault Outline
     u = np.linspace(0, 2 * np.pi, 36)
     v = np.linspace(0.1, np.pi - 0.1, 24)
     U, V = np.meshgrid(u, v)
@@ -165,38 +159,48 @@ def build_stereotactic_3d(img_np, bbox, eloquence_str):
 
     traces.append(go.Mesh3d(
         x=bx.flatten(), y=by.flatten(), z=bz.flatten(),
-        color='#38bdf8', opacity=0.07, alphahull=0,
+        color='#38bdf8', opacity=0.06, alphahull=0,
         name='Cranial Vault', hoverinfo='skip'
     ))
 
-    target_x = (cx / w - 0.5) * world_w
-    target_y = (0.5 - cy / h) * world_h
-    rad_x = max((bw / w) * (world_w / 2), 4.0)
-    rad_y = max((bh / h) * (world_h / 2), 4.0)
-    rad_z = (rad_x + rad_y) * 0.45
+    # Render All Lesions in 3D
+    colors = ['#ef4444', '#f97316', '#a855f7']
+    primary_target_x = 0.0
 
-    tu = np.linspace(0, 2 * np.pi, 24)
-    tv = np.linspace(0, np.pi, 24)
-    TU, TV = np.meshgrid(tu, tv)
-    lobulation = 1.0 + 0.12 * np.sin(3 * TU) * np.sin(2 * TV)
-    tx = target_x + rad_x * np.cos(TU) * np.sin(TV) * lobulation
-    ty = target_y + rad_y * np.sin(TU) * np.sin(TV) * lobulation
-    tz = rad_z * np.cos(TV) * lobulation
+    for idx, lesion in enumerate(lesions[:3]):
+        lx, ly, lbw, lbh = lesion["bbox"]
+        lcx, lcy = lx + lbw // 2, ly + lbh // 2
+        tx = (lcx / w - 0.5) * world_w
+        ty = (0.5 - lcy / h) * world_h
+        if idx == 0:
+            primary_target_x = tx
 
-    traces.append(go.Mesh3d(
-        x=tx.flatten(), y=ty.flatten(), z=tz.flatten(),
-        color='#ef4444', opacity=0.92, alphahull=0,
-        name='Target Neoplasm Mass', hoverinfo='name'
-    ))
+        rad_x = max((lbw / w) * (world_w / 2), 3.5)
+        rad_y = max((lbh / h) * (world_h / 2), 3.5)
+        rad_z = (rad_x + rad_y) * 0.45
 
+        tu = np.linspace(0, 2 * np.pi, 20)
+        tv = np.linspace(0, np.pi, 20)
+        TU, TV = np.meshgrid(tu, tv)
+        mx = tx + rad_x * np.cos(TU) * np.sin(TV)
+        my = ty + rad_y * np.sin(TU) * np.sin(TV)
+        mz = rad_z * np.cos(TV)
+
+        traces.append(go.Mesh3d(
+            x=mx.flatten(), y=my.flatten(), z=mz.flatten(),
+            color=colors[idx % len(colors)], opacity=0.92, alphahull=0,
+            name=f"Lesion #{idx+1} ({lesion['location']})", hoverinfo='name'
+        ))
+
+    # DTI Tractography Simulation
     tract_z = np.linspace(-35, 35, 50)
-    tract_color = '#f97316' if "HIGH ELOQUENCE" in eloquence_str else '#06b6d4'
-    tract_status = "Subcortical Tract (COMPRESSED/AT RISK)" if "HIGH ELOQUENCE" in eloquence_str else "Corticospinal Tract (Clear Margin)"
+    tract_color = '#f97316' if "HIGH ELOQUENCE" in primary_eloquence else '#06b6d4'
+    tract_status = "Subcortical Tract (COMPRESSED/AT RISK)" if "HIGH ELOQUENCE" in primary_eloquence else "Corticospinal Tract (Clear Margin)"
 
     for offset_x in [-10, 0, 10]:
         for offset_y in [-6, 6]:
-            deflection = 9.0 * np.exp(-((tract_z) ** 2) / 200) if "HIGH ELOQUENCE" in eloquence_str else 0.0
-            tx_line = (target_x + offset_x * 0.8) + (deflection if target_x > 0 else -deflection)
+            deflection = 9.0 * np.exp(-((tract_z) ** 2) / 200) if "HIGH ELOQUENCE" in primary_eloquence else 0.0
+            tx_line = (primary_target_x + offset_x * 0.8) + (deflection if primary_target_x > 0 else -deflection)
             ty_line = np.linspace(-25, 20, 50) + offset_y
             traces.append(go.Scatter3d(
                 x=tx_line if isinstance(tx_line, np.ndarray) else np.full_like(tract_z, tx_line),
@@ -249,48 +253,50 @@ if uploaded_file is not None and model_ready:
         img_batch = np.expand_dims(img_resized, axis=0)
 
         raw_pred = float(model.predict(img_batch)[0][0])
-        
-        has_tumor = (raw_pred > 0.5)
+        lesions = isolate_all_tumors(img_np)
+
+        # Smart consensus: Positive if model confidence > 0.5 OR multiple validated lesions exist
+        has_tumor = (raw_pred > 0.5) or (len(lesions) > 0)
         confidence = raw_pred if has_tumor else (1.0 - raw_pred)
 
-        tumor_contour = None
-        bbox = (0, 0, 0, 0)
-        location_str = "N/A"
-        eloquence_str = "N/A"
-        major_axis_mm = 0.0
+        primary_location = lesions[0]["location"] if len(lesions) > 0 else "Inconclusive"
+        primary_eloquence = lesions[0]["eloquence"] if len(lesions) > 0 else "NON-ELOQUENT / PERIPHERAL CORTEX"
+        major_axis_mm = lesions[0]["diameter_mm"] if len(lesions) > 0 else (22.0 if has_tumor else 0.0)
 
         with col2:
             st.subheader("2. AI Precision Lesion Segmentation")
             annotated = img_np.copy()
 
-            if has_tumor:
-                tumor_contour, bbox, location_str, eloquence_str = isolate_hyperintense_tumor(img_np)
-                x, y, w, h = bbox
-                if tumor_contour is not None and w > 0:
-                    cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                    cv2.drawContours(annotated, [tumor_contour], -1, (255, 0, 0), 2)
-                    major_axis_mm = max(w, h) * 0.42
-                    st.image(annotated, caption="Segmented Focal Lesion (Green: ROI, Blue: Neoplasm Boundary)", use_container_width=True)
-                else:
-                    major_axis_mm = 22.0
-                    st.image(annotated, caption="Diffuse Infiltrative Hyperintensity (Non-circumscribed)", use_container_width=True)
-            else:
-                st.image(img_np, caption="Normal Brain Parenchyma (No Focal Enhancing Mass)", use_container_width=True)
+            if has_tumor and len(lesions) > 0:
+                for idx, item in enumerate(lesions):
+                    bx, by, bw, bh = item["bbox"]
+                    box_color = (0, 255, 0) if idx == 0 else (0, 165, 255)
+                    cv2.rectangle(annotated, (bx, by), (bx + bw, by + bh), box_color, 2)
+                    cv2.drawContours(annotated, [item["contour"]], -1, (255, 0, 0), 2)
+                    cv2.putText(annotated, f"#{idx+1}", (bx, max(15, by - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
 
-        if has_tumor and tumor_contour is not None and bbox[2] > 0:
+                status_label = f"Identified {len(lesions)} Lesion(s) [Multifocal / Disseminated Burden]" if len(lesions) > 1 else "Unifocal Neoplasm Segmented (Green: Primary ROI, Blue: Margin)"
+                st.image(annotated, caption=status_label, use_container_width=True)
+            elif has_tumor and len(lesions) == 0:
+                st.image(img_np, caption="Diffuse Infiltrative Hyperintensity (Non-circumscribed Mass)", use_container_width=True)
+            else:
+                st.image(img_np, caption="Normal Brain Parenchyma (Preserved Bilateral Symmetry)", use_container_width=True)
+
+        if has_tumor and len(lesions) > 0:
             st.write("---")
             st.subheader("3. 3D Stereotactic Localization & DTI Tractography Simulation")
-            fig_3d = build_stereotactic_3d(img_np, bbox, eloquence_str)
+            fig_3d = build_stereotactic_3d(img_np, lesions, primary_eloquence)
             st.plotly_chart(fig_3d, use_container_width=True)
 
         st.write("---")
         st.subheader("4. Quantitative Radiomics Telemetry")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Diagnostic Verdict", "Positive: Neoplasm" if has_tumor else "Negative / Normal")
-        m2.metric("Inference Confidence", f"{confidence * 100:.2f}%")
-        m3.metric("Estimated Major Diameter", f"{major_axis_mm:.1f} mm" if has_tumor else "N/A")
         vol_cm3 = ((4/3) * 3.1415 * ((major_axis_mm / 2) ** 3)) / 1000 if has_tumor else 0.0
-        m4.metric("Estimated Volume", f"{vol_cm3:.2f} cm³" if has_tumor else "N/A")
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Diagnostic Verdict", f"Positive ({len(lesions)} Foci)" if (has_tumor and len(lesions) > 1) else ("Positive: Neoplasm" if has_tumor else "Negative / Normal"))
+        m2.metric("Inference Confidence", f"{confidence * 100:.2f}%")
+        m3.metric("Dominant Diameter", f"{major_axis_mm:.1f} mm" if has_tumor else "N/A")
+        m4.metric("Focal Volume Index", f"{vol_cm3:.2f} cm³" if has_tumor else "N/A")
 
         st.write("---")
         st.subheader("5. Clinical Decision Support System (CDSS) & Patient Triage")
@@ -328,6 +334,7 @@ if uploaded_file is not None and model_ready:
                 presentation = sc3.selectbox("Primary Clinical Deficit", sym_list, index=sym_list.index(st.session_state["p_sym"]))
                 contrast_avid = sc4.selectbox("T1-CE Enhancement Margin", ["Thick Irregular Rim (Necrotic Core)", "Homogeneous Solid", "Non-Enhancing / Infiltrative"])
 
+            # Oncology Triage & RTOG RPA Class Assignment
             if patient_age < 50 and kps_score >= 70:
                 rpa_class = "RTOG RPA Class III (Favorable / Aggressive Resection Candidate)"
                 rpa_badge_bg = "#059669"
@@ -344,8 +351,10 @@ if uploaded_file is not None and model_ready:
                 expected_os = "6.5 - 9.1 Months (Palliative Paradigm)"
                 base_surgery = "Frameless Stereotactic Needle Biopsy only (Avoid open craniotomy morbidity; histological confirmation priority)."
 
-            if "HIGH ELOQUENCE" in eloquence_str and kps_score >= 70:
+            if "HIGH ELOQUENCE" in primary_eloquence and kps_score >= 70:
                 surgical_approach = f"Awake Craniotomy with Direct Cortical/Subcortical Mapping + {base_surgery}"
+            elif len(lesions) > 1:
+                surgical_approach = f"Targeted Biopsy / Cytoreduction of Dominant Lesion + Whole Brain Radiotherapy (WBRT) / SRS Consultation."
             else:
                 surgical_approach = base_surgery
 
@@ -357,7 +366,7 @@ if uploaded_file is not None and model_ready:
             antiepileptic = "IV Levetiracetam (Keppra) 1000 mg loading dose, followed by 500 mg PO BID maintenance" if "Seizures" in presentation else "Prophylactic Levetiracetam 500 mg PO BID initiated 48h pre-operatively"
             adj_therapy = 'Hypofractionated Radiotherapy (40 Gy in 15 fractions) with single-agent concurrent Temozolomide.' if kps_score < 70 else 'Standard Stupp Protocol: Fractionated Focal EBRT (60 Gy in 30 fractions over 6 weeks) with concurrent Temozolomide (75 mg/m²/day), followed by 6 cycles of maintenance Temozolomide (150-200 mg/m²/day for 5 days per 28-day cycle).'
             shift_color = '#f85149' if midline_shift_est >= 5 else '#e3b341'
-            hist_susp = 'Glioblastoma Multiforme (WHO Grade IV Astrocytoma)' if major_axis_mm > 30 else 'High-Grade Infiltrative Glioma (WHO Grade III/IV)'
+            hist_susp = 'Multifocal High-Grade Neoplasm / CNS Metastases' if len(lesions) > 1 else ('Glioblastoma Multiforme (WHO Grade IV Astrocytoma)' if major_axis_mm > 30 else 'High-Grade Infiltrative Glioma (WHO Grade III/IV)')
 
             report_html = (
                 f"<div style='background: #0d1117; border: 1px solid #30363d; border-left: 6px solid {rpa_badge_bg}; padding: 22px; border-radius: 10px; font-family: sans-serif; margin-top: 15px;'>"
@@ -367,13 +376,13 @@ if uploaded_file is not None and model_ready:
                 f"<div style='background: {rpa_badge_bg}; color: #ffffff; padding: 6px 14px; border-radius: 6px; font-weight: 700; font-size: 12px;'>{rpa_class}</div>"
                 f"</div>"
                 f"<div style='display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; background: #161b22; padding: 14px; border-radius: 6px; border: 1px solid #30363d; margin-bottom: 16px;'>"
-                f"<div><span style='color: #8b949e; font-size: 11px;'>ANATOMICAL TOPOGRAPHY</span><br><strong style='color: #f0f6fc; font-size: 13px;'>{location_str}</strong></div>"
-                f"<div><span style='color: #8b949e; font-size: 11px;'>VOLUMETRIC MASS INDEX</span><br><strong style='color: #f0f6fc; font-size: 13px;'>{vol_cm3:.2f} cm³ ({major_axis_mm:.1f} mm)</strong></div>"
+                f"<div><span style='color: #8b949e; font-size: 11px;'>ANATOMICAL TOPOGRAPHY</span><br><strong style='color: #f0f6fc; font-size: 13px;'>{primary_location}</strong></div>"
+                f"<div><span style='color: #8b949e; font-size: 11px;'>DOMINANT MASS INDEX</span><br><strong style='color: #f0f6fc; font-size: 13px;'>{vol_cm3:.2f} cm³ ({major_axis_mm:.1f} mm)</strong></div>"
                 f"<div><span style='color: #8b949e; font-size: 11px;'>MIDLINE SHIFT INDEX</span><br><strong style='color: {shift_color}; font-size: 13px;'>~{midline_shift_est} mm ({herniation_risk})</strong></div>"
-                f"<div><span style='color: #8b949e; font-size: 11px;'>PERILESIONAL EDEMA</span><br><strong style='color: #f0f6fc; font-size: 13px;'>{edema_burden}</strong></div>"
+                f"<div><span style='color: #8b949e; font-size: 11px;'>BURDEN / PERILESIONAL EDEMA</span><br><strong style='color: #f0f6fc; font-size: 13px;'>{len(lesions)} Foci | {edema_burden}</strong></div>"
                 f"</div>"
                 f"<div style='background: #1f1d2e; border: 1px solid #453c69; padding: 10px 14px; border-radius: 6px; margin-bottom: 16px; font-size: 13px; color: #dcd7f5;'>"
-                f"⚡ <strong>Cortical Functional Eloquence:</strong> <span style='color: #ff7b72;'>{eloquence_str}</span>"
+                f"⚡ <strong>Cortical Functional Eloquence:</strong> <span style='color: #ff7b72;'>{primary_eloquence}</span>"
                 f"</div>"
                 f"<table style='width: 100%; border-collapse: collapse; margin-bottom: 16px; font-size: 13px; color: #c9d1d9;'>"
                 f"<tr style='background: #161b22; border-bottom: 1px solid #30363d;'><th style='padding: 10px; text-align: left; color: #58a6ff; width: 30%;'>Clinical Parameter</th><th style='padding: 10px; text-align: left; color: #58a6ff;'>Evaluated Value / Radiogenomic Marker Status</th></tr>"
@@ -456,12 +465,12 @@ if uploaded_file is not None and model_ready:
     <div class="sec-title">2. Quantitative Neuro-Imaging Radiomics</div>
     <table>
         <tr>
-            <th width="25%">Spatial Topography</th><td>{location_str}</td>
-            <th width="25%">Cortical Eloquence</th><td style="color: #b91c1c; font-weight: bold;">{eloquence_str}</td>
+            <th width="25%">Spatial Topography</th><td>{primary_location} ({len(lesions)} Identified Focus)</td>
+            <th width="25%">Cortical Eloquence</th><td style="color: #b91c1c; font-weight: bold;">{primary_eloquence}</td>
         </tr>
         <tr>
-            <th>Major Axis Diameter</th><td>{major_axis_mm:.1f} mm</td>
-            <th>Volumetric Mass Index</th><td>{vol_cm3:.2f} cm³</td>
+            <th>Dominant Axis Diameter</th><td>{major_axis_mm:.1f} mm</td>
+            <th>Focal Volumetric Mass</th><td>{vol_cm3:.2f} cm³</td>
         </tr>
         <tr>
             <th>Midline Shift Deflection</th><td>~{midline_shift_est} mm ({herniation_risk})</td>
